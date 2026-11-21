@@ -1,4 +1,6 @@
 streamlit
 pandas
-google-genai
 pypdf
+google-genai
+pillow
+psycopg2-binary
