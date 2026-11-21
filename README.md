@@ -1,41 +1,29 @@
-# Smart Exam Preparation & Personal Learning Tutor
+# Smart Exam Tutor
 
-## About the Project
-An AI-powered exam preparation application developed using Python and Streamlit.
+An AI exam-preparation coach. Students create an account, add their subjects
+(syllabus PDF + exam date + optional question-paper pattern or photo), and the
+app builds a study plan, teaches topics step by step, quizzes them and tracks
+progress. Everything is saved to the student's account.
 
-The application helps students organise their exam preparation, understand lessons, practise questions and monitor their learning progress.
+## Where the data is saved
 
-## Features
-- Student exam preparation dashboard
-- Subject and syllabus management
-- Smart study planning
-- AI-powered learning assistance using Google Gemini
-- Practice quizzes and explanations
-- Student progress tracking
+- **On the live site (Streamlit Cloud):** files are erased on every restart, so
+  the app needs an online PostgreSQL database. Create a free one (for example
+  at neon.com), copy its connection string and put it in the app's Secrets as
+  `DATABASE_URL` (see `secrets_example.toml`). Without it, the app shows a
+  warning because accounts would be lost.
+- **On your own computer:** with no `DATABASE_URL`, the app saves to
+  `smart_exam_tutor.db` next to `app.py`. Back that file up and never share it.
 
-## Technologies Used
-- Python
-- Streamlit
-- Google Gemini API
-- Pandas
-- Matplotlib
+## Run on your computer (Windows)
 
-## Installation
+    D:\python\python.exe -m pip install -r requirements.txt
+    setx GEMINI_API_KEY "PASTE_YOUR_KEY_HERE"
+    D:\python\python.exe -m streamlit run .\app.py
 
-Install the required packages:
+## Notes
 
-```bash
-pip install -r requirements.txt
-```
-
-## Run the Application
-
-```bash
-streamlit run app.py
-```
-
-## Security
-The Gemini API key should be configured securely using Streamlit Secrets. Never publish API keys or passwords in the repository.
-
-## Developed As
-A Python college project.
+- Passwords are stored as salted PBKDF2 hashes. There is no password reset.
+- Never put keys or the database address in the code or on GitHub.
+- All visitors share the Gemini key set in the app's Secrets, so its free quota
+  is shared too.
