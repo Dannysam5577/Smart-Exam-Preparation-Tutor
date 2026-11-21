@@ -1,14 +1,27 @@
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import sqlite3
 import time
+from contextlib import closing
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
+
+# The online database driver is optional: without it the app uses a local file
+try:
+    import psycopg2
+    PG_AVAILABLE = True
+except ImportError:
+    psycopg2 = None
+    PG_AVAILABLE = False
 
 # PDF reading is optional at import time so the app still opens if pypdf is missing
 try:
@@ -772,14 +785,474 @@ def delete_subject(name):
 
 
 # =====================================================================
+# ACCOUNTS AND SAVED PROGRESS (SQLite database file)
+# =====================================================================
+
+DB_PATH = os.getenv("SMART_TUTOR_DB") or str(
+    Path(__file__).resolve().parent / "smart_exam_tutor.db"
+)
+PW_ITERATIONS = 200_000
+MAX_FAILS = 5          # wrong passwords before a short lock
+LOCK_SECONDS = 60
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,30}$")
+
+# What is saved for each account (never the API key)
+PERSIST_KEYS = {
+    "student_name": str,
+    "subjects": list,
+    "completed": dict,
+    "study_plans": dict,
+    "tutor_chats": dict,
+    "ai_questions": dict,
+    "practice_results": list,
+    "weak_topics": list,
+    "activity_days": list,
+}
+
+
+def get_database_url():
+    """Online database (PostgreSQL) address from the secrets, or '' for the local file."""
+    url = os.getenv("DATABASE_URL")
+
+    if not url:
+        try:
+            url = st.secrets.get("DATABASE_URL", "")
+        except Exception:
+            url = ""
+
+    return str(url or "").strip()
+
+
+def on_streamlit_cloud():
+    return str(Path(__file__).resolve()).startswith("/mount/src")
+
+
+DB_ERRORS = (sqlite3.Error,) + ((psycopg2.Error,) if PG_AVAILABLE else ())
+DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + (
+    (psycopg2.IntegrityError,) if PG_AVAILABLE else ()
+)
+
+
+def _db():
+    url = get_database_url()
+
+    if url:
+        if not PG_AVAILABLE:
+            raise RuntimeError(
+                "DATABASE_URL is set but the psycopg2-binary package is not "
+                "installed. Add psycopg2-binary to requirements.txt."
+            )
+        return psycopg2.connect(url, connect_timeout=15)
+
+    return sqlite3.connect(DB_PATH, timeout=10)
+
+
+def _run(conn, sql, params=()):
+    """Run one statement on either database. SQL is written with ? placeholders."""
+    if get_database_url():
+        sql = sql.replace("?", "%s")
+
+    cursor = conn.cursor()
+    cursor.execute(sql, params)
+    return cursor
+
+
+def _as_bytes(value):
+    """Salts and hashes are stored as hex text; older local files hold raw bytes."""
+    return bytes.fromhex(value) if isinstance(value, str) else bytes(value)
+
+
+def storage_label():
+    return "cloud database" if get_database_url() else "this computer"
+
+
+def init_db():
+    with closing(_db()) as conn:
+        _run(
+            conn,
+            """CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                pw_hash TEXT NOT NULL,
+                iterations INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                fails INTEGER NOT NULL DEFAULT 0,
+                locked_until DOUBLE PRECISION NOT NULL DEFAULT 0
+            )"""
+        )
+        _run(
+            conn,
+            """CREATE TABLE IF NOT EXISTS user_data (
+                username TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.commit()
+
+
+def _hash_password(password, salt, iterations=PW_ITERATIONS):
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations
+    )
+
+
+def create_user(username, password):
+    """Returns (ok, message). On success the message is the display name."""
+    username = username.strip()
+
+    if not USERNAME_RE.match(username):
+        return False, (
+            "Username must be 3 to 30 characters: letters, numbers, "
+            "dot, dash or underscore."
+        )
+
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+
+    salt = os.urandom(16)
+
+    try:
+        with closing(_db()) as conn:
+            _run(
+                conn,
+                "INSERT INTO users (username, display_name, salt, pw_hash, "
+                "iterations, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    username.lower(), username, salt.hex(),
+                    _hash_password(password, salt).hex(), PW_ITERATIONS,
+                    datetime.now().isoformat(timespec="seconds"),
+                )
+            )
+            conn.commit()
+    except DB_INTEGRITY_ERRORS:
+        return False, "That username is already taken."
+
+    return True, username
+
+
+def verify_login(username, password):
+    """Returns (ok, message, username_key, display_name)."""
+    key = username.strip().lower()
+    wrong = "Wrong username or password."
+
+    with closing(_db()) as conn:
+        row = _run(
+            conn,
+            "SELECT display_name, salt, pw_hash, iterations, fails, "
+            "locked_until FROM users WHERE username = ?",
+            (key,)
+        ).fetchone()
+
+        if row is None:
+            # Take the same time as a real check so usernames can't be probed
+            _hash_password(password, b"\0" * 16)
+            return False, wrong, None, None
+
+        display, salt, pw_hash, iterations, fails, locked_until = row
+        salt, pw_hash = _as_bytes(salt), _as_bytes(pw_hash)
+        now = time.time()
+
+        if locked_until and locked_until > now:
+            wait = int(locked_until - now) + 1
+            return False, f"Too many wrong attempts. Try again in {wait} seconds.", None, None
+
+        if hmac.compare_digest(_hash_password(password, salt, iterations), pw_hash):
+            _run(
+                conn,
+                "UPDATE users SET fails = 0, locked_until = 0 WHERE username = ?",
+                (key,)
+            )
+            conn.commit()
+            return True, "", key, display
+
+        fails += 1
+        lock_until = 0
+
+        if fails >= MAX_FAILS:
+            lock_until, fails = now + LOCK_SECONDS, 0
+
+        _run(
+            conn,
+            "UPDATE users SET fails = ?, locked_until = ? WHERE username = ?",
+            (fails, lock_until, key)
+        )
+        conn.commit()
+
+    if lock_until:
+        return False, f"Too many wrong attempts. Try again in {LOCK_SECONDS} seconds.", None, None
+
+    return False, wrong, None, None
+
+
+def _json_default(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return {"__date__": value.isoformat()}
+    if hasattr(value, "item"):          # numpy numbers
+        return value.item()
+    return str(value)
+
+
+def _json_hook(obj):
+    if len(obj) == 1 and "__date__" in obj:
+        try:
+            return date.fromisoformat(obj["__date__"])
+        except ValueError:
+            return obj
+    return obj
+
+
+def dump_user_state(state):
+    payload = {key: state.get(key) for key in PERSIST_KEYS}
+    return json.dumps(payload, default=_json_default, sort_keys=True)
+
+
+def load_user_state(username):
+    """Saved data for an account; wrong-typed or damaged parts are ignored."""
+    with closing(_db()) as conn:
+        row = _run(
+            conn, "SELECT data FROM user_data WHERE username = ?", (username,)
+        ).fetchone()
+
+    if not row:
+        return {}
+
+    try:
+        saved = json.loads(row[0], object_hook=_json_hook)
+    except ValueError:
+        return {}
+
+    if not isinstance(saved, dict):
+        return {}
+
+    return {
+        key: value for key, value in saved.items()
+        if key in PERSIST_KEYS and isinstance(value, PERSIST_KEYS[key])
+    }
+
+
+def save_user_state(username, payload):
+    with closing(_db()) as conn:
+        _run(
+            conn,
+            "INSERT INTO user_data (username, data, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET data = excluded.data, "
+            "updated_at = excluded.updated_at",
+            (username, payload, datetime.now().isoformat(timespec="seconds"))
+        )
+        conn.commit()
+
+
+def study_streak(days):
+    """Consecutive days of activity, counting back from today (or yesterday)."""
+    active = set(days)
+    day = date.today()
+
+    if day.isoformat() not in active:
+        day -= timedelta(days=1)
+
+    count = 0
+
+    while day.isoformat() in active:
+        count += 1
+        day -= timedelta(days=1)
+
+    return count
+
+
+def record_activity():
+    today = date.today().isoformat()
+    days = st.session_state.get("activity_days")
+
+    if not isinstance(days, list):
+        days = st.session_state.activity_days = []
+
+    if today not in days:
+        days.append(today)
+        del days[:-400]
+
+
+def autosave():
+    """Save the signed-in student's data whenever it has changed."""
+    user = st.session_state.get("user")
+
+    if not user:
+        return
+
+    payload = dump_user_state(st.session_state)
+
+    if payload == st.session_state.get("_saved_payload"):
+        return
+
+    try:
+        save_user_state(user, payload)
+        st.session_state["_saved_payload"] = payload
+        st.session_state["_save_error"] = ""
+    except Exception as error:
+        st.session_state["_save_error"] = str(error)[:200]
+
+
+def start_session(key, display, student_name=""):
+    """Sign in: load the saved data for this account into the session."""
+    st.session_state.user = key
+    st.session_state.user_display = display
+
+    for name, value in load_user_state(key).items():
+        st.session_state[name] = value
+
+    if student_name and not st.session_state.get("student_name"):
+        st.session_state.student_name = student_name
+
+    st.session_state["_saved_payload"] = None
+
+
+def db_error_text(error):
+    return (
+        "I couldn't reach the database right now. Wait a few seconds and try "
+        f"again. ({str(error).strip()[:160]})"
+    )
+
+
+def storage_warning():
+    """A host that erases files must not be used with the local database file."""
+    if on_streamlit_cloud() and not get_database_url():
+        st.warning(
+            "⚠️ This app is running without an online database, so accounts "
+            "and progress will be erased whenever the app restarts. The app "
+            "owner must add DATABASE_URL to the app's Secrets."
+        )
+
+
+def render_login():
+    hero(
+        "Smart Exam Tutor",
+        "Log in to continue your preparation. Your subjects and progress are saved to your account.",
+        icon="🔐",
+        badge="STUDENT LOGIN"
+    )
+
+    _, middle, _ = st.columns([1, 1.7, 1])
+
+    with middle:
+        storage_warning()
+
+        tab_login, tab_signup = st.tabs(["🔐 Log in", "✨ Create account"])
+
+        with tab_login:
+            with st.form("login_form"):
+                username = st.text_input("Username", key="login_user")
+                password = st.text_input("Password", type="password", key="login_pass")
+                go = st.form_submit_button(
+                    "Log in", type="primary", use_container_width=True
+                )
+
+            if go:
+                try:
+                    with st.spinner("Signing in..."):
+                        ok, message, key, display = verify_login(username, password)
+                except Exception as error:
+                    st.error(db_error_text(error))
+                    ok, message = False, ""
+
+                if ok:
+                    start_session(key, display)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+        with tab_signup:
+            with st.form("signup_form"):
+                name = st.text_input("Your name", key="reg_name")
+                username = st.text_input(
+                    "Choose a username", key="reg_user",
+                    help="3 to 30 letters, numbers, dot, dash or underscore."
+                )
+                password = st.text_input(
+                    "Choose a password", type="password", key="reg_pass",
+                    help="At least 6 characters."
+                )
+                again = st.text_input(
+                    "Repeat the password", type="password", key="reg_pass2"
+                )
+                go = st.form_submit_button(
+                    "Create account", type="primary", use_container_width=True
+                )
+
+            if go:
+                if password != again:
+                    st.error("The two passwords do not match.")
+                else:
+                    try:
+                        with st.spinner("Creating your account..."):
+                            ok, message = create_user(username, password)
+                    except Exception as error:
+                        st.error(db_error_text(error))
+                        ok, message = False, ""
+
+                    if ok:
+                        start_session(
+                            username.strip().lower(), message,
+                            student_name=name.strip() or message
+                        )
+                        st.rerun()
+                    elif message:
+                        st.error(message)
+
+        st.caption(
+            "Passwords are stored as salted hashes, never as plain text. "
+            "There is no password reset, so remember yours."
+        )
+
+
+# =====================================================================
 # HELPER FUNCTIONS - GEMINI
 # =====================================================================
 
+MAX_SHARED_CALLS = 60   # AI calls per visit when the owner's key is used
+
+
+def get_api_key():
+    """A key the visitor pasted in the sidebar wins, then the app owner's key."""
+    visitor_key = str(st.session_state.get("user_api_key", "") or "").strip()
+
+    if visitor_key:
+        return visitor_key
+
+    owner_key = os.getenv("GEMINI_API_KEY")
+
+    if owner_key:
+        return owner_key
+
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "") or "")
+    except Exception:
+        return ""
+
+
+def using_visitor_key():
+    return bool(str(st.session_state.get("user_api_key", "") or "").strip())
+
+
 def call_gemini(contents, system_instruction=None, json_mode=False):
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_api_key()
 
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY was not found.")
+
+    # Protect the owner's free quota on a public app
+    if not using_visitor_key():
+        used = st.session_state.get("ai_calls", 0)
+
+        if used >= MAX_SHARED_CALLS:
+            raise RuntimeError(
+                "The shared AI limit for this visit was reached. Paste your "
+                "own free Gemini key in the sidebar to keep going."
+            )
+
+        st.session_state.ai_calls = used + 1
 
     client = genai.Client(api_key=api_key)
 
@@ -1095,7 +1568,7 @@ def read_syllabus(raw_bytes, text):
     """Returns {'rows', 'info', 'method', 'notice'}. Gemini first, basic reader second."""
     notice = ""
 
-    if os.getenv("GEMINI_API_KEY"):
+    if get_api_key():
         try:
             rows, info = extract_syllabus_ai(raw_bytes, text)
 
@@ -1124,7 +1597,11 @@ def page_subjects():
         st.success(st.session_state.flash)
         st.session_state.flash = None
 
-    st.text_input("Student name", key="student_name")
+    st.session_state.student_name = st.text_input(
+        "Student name",
+        value=st.session_state.student_name,
+        key="student_name_input"
+    )
 
     count = len(st.session_state.subjects)
     tab_add, tab_manage = st.tabs(
@@ -1400,7 +1877,7 @@ def render_add_subject():
                 key=f"read_photo_{fid}",
                 type="primary" if not cached else "secondary"
             ):
-                if not os.getenv("GEMINI_API_KEY"):
+                if not get_api_key():
                     st.error(
                         "Reading photos needs your Gemini API key "
                         "(GEMINI_API_KEY)."
@@ -1932,7 +2409,7 @@ def page_tutor(s):
         with st.chat_message("user"):
             st.markdown(question)
 
-        if not os.getenv("GEMINI_API_KEY"):
+        if not get_api_key():
             st.warning("Gemini API key not detected. Please check your API setup.")
         else:
             with st.chat_message("assistant"):
@@ -2012,7 +2489,7 @@ def page_practice(s):
     )
 
     if st.button(button_label):
-        if not os.getenv("GEMINI_API_KEY"):
+        if not get_api_key():
             st.warning("Gemini API key not detected. Please check your API setup.")
         else:
             with st.spinner("Creating questions..."):
@@ -2557,6 +3034,7 @@ def sidebar_status():
         f'<div class="top"><span>RANK: {esc(info["rank"]).upper()}</span><span>LV {info["level"]}</span></div>'
         f'<div class="bar"><div style="width:{percent:.0f}%"></div></div>'
         f'<div class="sub">{info["xp"]} XP · {info["to_next"]} to next level</div>'
+        f'<div class="sub">🔥 {study_streak(st.session_state.get("activity_days", []))}-day study streak</div>'
         '</div>',
         unsafe_allow_html=True
     )
@@ -2755,7 +3233,7 @@ def get_lesson_steps(subject, topic, unit):
     """Returns (steps, notice). Uses Gemini when possible, else the built-in lesson."""
     notice = ""
 
-    if os.getenv("GEMINI_API_KEY"):
+    if get_api_key():
         try:
             steps = generate_lesson_steps(subject, topic, unit)
             if steps:
@@ -2784,7 +3262,7 @@ def get_quiz_questions(subject, topic):
 
     notice = ""
 
-    if os.getenv("GEMINI_API_KEY"):
+    if get_api_key():
         try:
             questions = generate_ai_questions(subject, topic, 5)
             if questions:
@@ -3041,7 +3519,7 @@ def coach_mission(subject, cs):
         st.caption("8 mixed questions from the topics you have studied (or the top priorities).")
 
         if st.button("🧪 Take a mock test", key=f"coach_mock_{subject['name']}"):
-            if not os.getenv("GEMINI_API_KEY"):
+            if not get_api_key():
                 st.warning("Mock tests need your Gemini API key.")
             else:
                 topics = list(dict.fromkeys(weak + completed_for(subject)))
@@ -3152,7 +3630,7 @@ def coach_learn(subject, cs):
         if st.button("Ask", key=f"coach_doubt_btn_{subject['name']}_{topic}_{index}"):
             if not doubt.strip():
                 st.warning("Type your doubt first.")
-            elif not os.getenv("GEMINI_API_KEY"):
+            elif not get_api_key():
                 st.warning("Gemini API key not detected.")
             else:
                 with st.spinner("Thinking..."):
@@ -3350,7 +3828,54 @@ def page_coach(subject):
 
 inject_css()
 
+if not st.session_state.get("_db_ready"):
+    try:
+        init_db()
+        st.session_state["_db_ready"] = True
+    except Exception as error:
+        hero("Smart Exam Tutor", "The database is not reachable.", icon="⚠️", badge="DATABASE")
+        st.error(db_error_text(error))
+        st.stop()
+
+if not st.session_state.get("user"):
+    render_login()
+    st.stop()
+
+record_activity()
+
 sidebar_status()
+
+st.sidebar.caption(
+    f"👤 {st.session_state.get('user_display', st.session_state.user)} · "
+    f"💾 saved to {storage_label()}"
+)
+
+if on_streamlit_cloud() and not get_database_url():
+    st.sidebar.warning("Progress will be erased when the app restarts: no online database is set up.")
+
+if st.session_state.get("_save_error"):
+    st.sidebar.error("Could not save your progress: " + st.session_state["_save_error"])
+
+if st.sidebar.button("Log out", key="logout_btn"):
+    autosave()
+    st.session_state.clear()
+    st.rerun()
+
+with st.sidebar.expander(
+    "🔑 AI key " + ("· ready ✅" if get_api_key() else "· needed ⚠️"),
+    expanded=not get_api_key()
+):
+    st.text_input(
+        "Your Gemini API key (optional)",
+        type="password",
+        key="user_api_key",
+        help="Free keys are available in Google AI Studio. The key stays in "
+             "this browser session only and is never saved."
+    )
+    st.caption(
+        "Your syllabus and photos are sent to Google Gemini to create lessons "
+        "and quizzes. Avoid personal or sensitive documents."
+    )
 
 hero(
     "Smart Exam Tutor",
@@ -3395,3 +3920,7 @@ else:
             "Active subject", subject_names, key="active_subject"
         )
         SUBJECT_PAGES[page](get_subject(chosen))
+
+
+# Save the student's data (only writes when something changed)
+autosave()
