@@ -1211,16 +1211,8 @@ def render_login():
 # HELPER FUNCTIONS - GEMINI
 # =====================================================================
 
-MAX_SHARED_CALLS = 60   # AI calls per visit when the owner's key is used
-
-
 def get_api_key():
-    """A key the visitor pasted in the sidebar wins, then the app owner's key."""
-    visitor_key = str(st.session_state.get("user_api_key", "") or "").strip()
-
-    if visitor_key:
-        return visitor_key
-
+    """The app owner's Gemini key: environment variable, then Streamlit secrets."""
     owner_key = os.getenv("GEMINI_API_KEY")
 
     if owner_key:
@@ -1232,27 +1224,11 @@ def get_api_key():
         return ""
 
 
-def using_visitor_key():
-    return bool(str(st.session_state.get("user_api_key", "") or "").strip())
-
-
 def call_gemini(contents, system_instruction=None, json_mode=False):
     api_key = get_api_key()
 
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY was not found.")
-
-    # Protect the owner's free quota on a public app
-    if not using_visitor_key():
-        used = st.session_state.get("ai_calls", 0)
-
-        if used >= MAX_SHARED_CALLS:
-            raise RuntimeError(
-                "The shared AI limit for this visit was reached. Paste your "
-                "own free Gemini key in the sidebar to keep going."
-            )
-
-        st.session_state.ai_calls = used + 1
 
     client = genai.Client(api_key=api_key)
 
@@ -3860,22 +3836,6 @@ if st.sidebar.button("Log out", key="logout_btn"):
     autosave()
     st.session_state.clear()
     st.rerun()
-
-with st.sidebar.expander(
-    "🔑 AI key " + ("· ready ✅" if get_api_key() else "· needed ⚠️"),
-    expanded=not get_api_key()
-):
-    st.text_input(
-        "Your Gemini API key (optional)",
-        type="password",
-        key="user_api_key",
-        help="Free keys are available in Google AI Studio. The key stays in "
-             "this browser session only and is never saved."
-    )
-    st.caption(
-        "Your syllabus and photos are sent to Google Gemini to create lessons "
-        "and quizzes. Avoid personal or sensitive documents."
-    )
 
 hero(
     "Smart Exam Tutor",
